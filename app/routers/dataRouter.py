@@ -173,6 +173,7 @@ def get_mediciones_time_series(
             FROM mediciones
             WHERE id_estacion = :id_estacion 
                 AND id_elemento = :id_elemento
+                AND medicion >= 0
             ORDER BY fecha, hora;
         """)
         
