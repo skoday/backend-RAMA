@@ -2,11 +2,14 @@ from fastapi import APIRouter, status, HTTPException, Depends, Query
 from sqlalchemy.orm import Session
 from app.db_connection import get_db
 from sqlalchemy import func, select, text
-from datetime import date
+from datetime import datetime
 from app import db_models
 from app.schemas import (
     ElementoResponse, EstacionResponse, FechaRangeResponse,
-    MedicionTimeSeriesResponse)
+    MedicionTimeSeriesResponse, PredictionResult,
+    HistoricalDataPoint, PredictionResponse)
+from app.lstm import get_predictor, train_model_for_station_element
+import pandas as pd
 
 app = APIRouter(
     prefix='',
@@ -204,4 +207,139 @@ def get_mediciones_time_series(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error interno del servidor: {str(e)}"
+        )
+    
+
+@app.get(
+    '/mediciones/predict',
+    response_model=PredictionResult,
+    status_code=status.HTTP_200_OK,
+    summary="Generar predicciones de series de tiempo",
+    description="Genera predicciones para una estación y elemento específicos usando LSTM"
+)
+def predict_time_series(
+    id_estacion: int = Query(..., description="ID de la estación"),
+    id_elemento: int = Query(..., description="ID del elemento"),
+    start_date: str = Query(..., description="Fecha de inicio (YYYY-MM-DD HH:MM:SS)"),
+    end_date: str = Query(..., description="Fecha de fin (YYYY-MM-DD HH:MM:SS)"),
+    prediction_window: int = Query(..., description="Ventana de predicción en horas", ge=1, le=720),
+    db: Session = Depends(get_db)
+):
+    """
+    Genera predicciones de series de tiempo usando LSTM.
+    
+    Args:
+        id_estacion: ID de la estación
+        id_elemento: ID del elemento  
+        start_date: Fecha de inicio en formato YYYY-MM-DD HH:MM:SS
+        end_date: Fecha de fin en formato YYYY-MM-DD HH:MM:SS
+        prediction_window: Número de horas a predecir (máximo 720)
+        db: Sesión de base de datos
+        
+    Returns:
+        PredictionResult: Resultado con predicciones y metadatos
+    """
+    try:
+        # Validate dates
+        try:
+            start_dt = datetime.fromisoformat(start_date)
+            end_dt = datetime.fromisoformat(end_date)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Formato de fecha inválido. Use YYYY-MM-DD HH:MM:SS"
+            )
+        
+        if start_dt >= end_dt:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="La fecha de inicio debe ser anterior a la fecha de fin"
+            )
+        
+        # Get data from database with date filtering
+        query = text("""
+            SELECT 
+                fecha + INTERVAL '1 hour' * hora AS datetime,
+                medicion
+            FROM mediciones
+            WHERE id_estacion = :id_estacion 
+                AND id_elemento = :id_elemento
+                AND medicion >= 0
+                AND (fecha + INTERVAL '1 hour' * hora) BETWEEN :start_date AND :end_date
+            ORDER BY fecha, hora;
+        """)
+        
+        result = db.execute(query, {
+            'id_estacion': id_estacion,
+            'id_elemento': id_elemento,
+            'start_date': start_dt,
+            'end_date': end_dt
+        }).fetchall()
+        
+        if not result:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No se encontraron mediciones para los parámetros especificados"
+            )
+        
+        # Convert to DataFrame
+        data = []
+        for row in result:
+            data.append({
+                'datetime': row.datetime,
+                'medicion': float(row.medicion)
+            })
+        
+        df = pd.DataFrame(data)
+        df['datetime'] = pd.to_datetime(df['datetime'])
+        df = df.set_index('datetime')
+        
+        # Get predictor and make predictions
+        predictor = train_model_for_station_element(df)
+        predictions, timestamps = predictor.predict(df, prediction_window)
+        
+        # Format historical data response
+        historical_responses = []
+        for idx, row in df.iterrows():
+            historical_responses.append(HistoricalDataPoint(
+                timestamp=idx.isoformat(),
+                actual_value=float(row['medicion'])
+            ))
+        
+        # Format prediction response
+        prediction_responses = []
+        for pred, ts in zip(predictions, timestamps):
+            prediction_responses.append(PredictionResponse(
+                timestamp=ts,
+                predicted_value=float(pred)
+            ))
+        
+        return PredictionResult(
+            historical_data=historical_responses,  # NEW: Include historical data
+            predictions=prediction_responses,
+            model_info=predictor.get_model_info(),
+            data_info={
+                "input_records": len(df),
+                "date_range": f"{df.index.min()} to {df.index.max()}",
+                "station_id": id_estacion,
+                "element_id": id_elemento,
+                "prediction_window_hours": prediction_window,
+                "historical_data_points": len(historical_responses)  # NEW: Count of historical points
+            },
+            success=True,
+            message=f"Predicción generada exitosamente para {prediction_window} horas con {len(historical_responses)} puntos históricos"
+        )
+        
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Error de validación: {str(e)}"
+        )
+    except Exception as e:
+        #logger.error(f"Prediction error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error generando predicción: {str(e)}"
         )

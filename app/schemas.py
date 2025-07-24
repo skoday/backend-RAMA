@@ -55,3 +55,19 @@ class FechaRangeResponse(BaseModel):
 class MedicionTimeSeriesResponse(BaseModel):
     datetime: str
     medicion: float
+
+class PredictionResponse(BaseModel):
+    timestamp: str
+    predicted_value: float
+
+class HistoricalDataPoint(BaseModel):
+    timestamp: str
+    actual_value: float
+
+class PredictionResult(BaseModel):
+    historical_data: list[HistoricalDataPoint]  # NEW: Historical data used for prediction
+    predictions: list[PredictionResponse]
+    model_info: dict
+    data_info: dict
+    success: bool
+    message: str
