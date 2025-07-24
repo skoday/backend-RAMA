@@ -3,3 +3,8 @@ fastapi-cli==0.0.8
 psycopg2-binary==2.9.10
 pydantic-settings==2.10.1
 SQLAlchemy==2.0.41
+pandas==2.3.1
+scikit-learn==1.7.1
+torch==2.7.1
+torchaudio==2.7.1
+torchvision==0.22.1
